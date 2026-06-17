@@ -3,9 +3,10 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
+from urllib.parse import urlparse
 
 from dotenv import load_dotenv
 from pyrogram import Client
@@ -67,23 +68,69 @@ async def resolve_chat(client: Client, raw: str):
     value = raw.strip()
     if not value:
         raise ValueError("Ссылка/ID пустая")
+
+    normalized = normalize_chat_reference(value)
     try:
-        if value.startswith(("https://", "http://", "t.me/", "@")):
-            return await client.get_chat(value)
-        return await client.get_chat(int(value))
+        if isinstance(normalized, int):
+            return await client.get_chat(normalized)
+        return await client.get_chat(normalized)
     except (ValueError, UsernameInvalid, UsernameNotOccupied, PeerIdInvalid) as exc:
         raise ValueError(f"Не удалось найти чат: {value}") from exc
 
 
-def unique_users(rows: Iterable[UserRow]) -> list[UserRow]:
-    seen: set[int] = set()
-    result: list[UserRow] = []
-    for row in rows:
-        if row.user_id in seen:
-            continue
-        seen.add(row.user_id)
-        result.append(row)
-    return result
+def normalize_chat_reference(raw: str) -> int | str:
+    value = raw.strip()
+    if not value:
+        raise ValueError("Ссылка/ID пустая")
+
+    # Numeric chat id: -100..., -..., 123...
+    if re.fullmatch(r"-?\d+", value):
+        return int(value)
+
+    if value.startswith("@"):
+        username = value[1:].strip()
+        if not username:
+            raise ValueError("Пустой username после @")
+        return username
+
+    lower = value.lower()
+    if lower.startswith(("https://", "http://")):
+        parsed = urlparse(value)
+        host = parsed.netloc.lower()
+        path = parsed.path.strip("/")
+
+        if host.endswith("t.me") or host.endswith("telegram.me"):
+            if not path:
+                raise ValueError("В ссылке t.me не указан чат")
+
+            first_part = path.split("/", 1)[0].strip()
+            if first_part in {"c", "joinchat", "s", "share", "addstickers"}:
+                raise ValueError(
+                    "Этот тип ссылки не подходит для сбора. "
+                    "Используй публичный @username или ссылку вида https://t.me/<username>."
+                )
+            if first_part.startswith("+"):
+                raise ValueError(
+                    "Invite-ссылка требует вступления. Для открытого чата укажи @username."
+                )
+            return first_part
+
+        raise ValueError("Поддерживаются только ссылки t.me/telegram.me")
+
+    if lower.startswith("t.me/") or lower.startswith("telegram.me/"):
+        _, _, path = value.partition("/")
+        path = path.strip("/")
+        if not path:
+            raise ValueError("В ссылке t.me не указан чат")
+        first_part = path.split("/", 1)[0].strip()
+        if first_part.startswith("+") or first_part in {"joinchat", "c", "s"}:
+            raise ValueError(
+                "Эта ссылка не подходит. Используй публичный @username или https://t.me/<username>."
+            )
+        return first_part
+
+    # Plain username without @
+    return value
 
 
 async def run() -> None:
@@ -119,41 +166,45 @@ async def run() -> None:
         print(f"Источник: {chat.title} ({chat.id})")
         print("Начинаю сбор авторов из истории...")
 
-        rows: list[UserRow] = []
+        # Перезаписываем файл в начале запуска, затем дописываем по мере сбора.
+        out_path.write_text("", encoding="utf-8")
+        written_users = 0
+        seen_user_ids: set[int] = set()
         scanned = 0
 
-        async for msg in client.get_chat_history(chat.id):
-            scanned += 1
-            user = msg.from_user
-            if user and not user.is_bot and not user.is_deleted:
-                rows.append(
-                    UserRow(
+        with out_path.open("a", encoding="utf-8", newline="\n") as out_file:
+            async for msg in client.get_chat_history(chat.id):
+                scanned += 1
+                user = msg.from_user
+                if user and not user.is_bot and not user.is_deleted and user.id not in seen_user_ids:
+                    seen_user_ids.add(user.id)
+                    row = UserRow(
                         user_id=user.id,
                         username=user.username,
                         first_name=user.first_name,
                         last_name=user.last_name,
                     )
-                )
+                    out_file.write(f"{row.to_txt_line()}\n")
+                    out_file.flush()
+                    written_users += 1
 
-            if scanned % 100 == 0:
-                print(f"  сообщений просмотрено: {scanned}")
+                if scanned % 100 == 0:
+                    print(f"  сообщений просмотрено: {scanned} | уникальных записано: {written_users}")
 
-            if max_messages > 0 and scanned >= max_messages:
-                break
+                if max_messages > 0 and scanned >= max_messages:
+                    break
 
-            try:
-                await asyncio.sleep(interval)
-            except FloodWait as exc:
-                await asyncio.sleep(exc.value)
+                try:
+                    await asyncio.sleep(interval)
+                except FloodWait as exc:
+                    await asyncio.sleep(exc.value)
 
-        rows = unique_users(rows)
-        if not rows:
+        if written_users == 0:
             print("\nНе найдено пользователей среди авторов сообщений.")
             print("Проверь, есть ли публичная история и права на чтение сообщений.")
             return
 
-        out_path.write_text("\n".join(item.to_txt_line() for item in rows), encoding="utf-8")
-        print(f"\nГотово. Уникальных авторов: {len(rows)}")
+        print(f"\nГотово. Уникальных авторов: {written_users}")
         print(f"Просмотрено сообщений: {scanned}")
         print(f"База сохранена: {out_path}")
     finally:

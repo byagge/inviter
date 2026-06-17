@@ -3,9 +3,11 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
+from urllib.parse import urlparse
 
 from dotenv import load_dotenv
 from pyrogram import Client
@@ -67,12 +69,70 @@ async def resolve_chat(client: Client, raw: str):
     value = raw.strip()
     if not value:
         raise ValueError("Ссылка/ID пустая")
+
+    normalized = normalize_chat_reference(value)
     try:
-        if value.startswith(("https://", "http://", "t.me/", "@")):
-            return await client.get_chat(value)
-        return await client.get_chat(int(value))
+        if isinstance(normalized, int):
+            return await client.get_chat(normalized)
+        return await client.get_chat(normalized)
     except (ValueError, UsernameInvalid, UsernameNotOccupied, PeerIdInvalid) as exc:
         raise ValueError(f"Не удалось найти чат: {value}") from exc
+
+
+def normalize_chat_reference(raw: str) -> int | str:
+    value = raw.strip()
+    if not value:
+        raise ValueError("Ссылка/ID пустая")
+
+    # Numeric chat id: -100..., -..., 123...
+    if re.fullmatch(r"-?\d+", value):
+        return int(value)
+
+    if value.startswith("@"):
+        username = value[1:].strip()
+        if not username:
+            raise ValueError("Пустой username после @")
+        return username
+
+    lower = value.lower()
+    if lower.startswith(("https://", "http://")):
+        parsed = urlparse(value)
+        host = parsed.netloc.lower()
+        path = parsed.path.strip("/")
+
+        if host.endswith("t.me") or host.endswith("telegram.me"):
+            if not path:
+                raise ValueError("В ссылке t.me не указан чат")
+
+            first_part = path.split("/", 1)[0].strip()
+            if first_part in {"c", "joinchat", "s", "share", "addstickers"}:
+                raise ValueError(
+                    "Этот тип ссылки не подходит для сбора. "
+                    "Используй публичный @username или ссылку вида https://t.me/<username>."
+                )
+            if first_part.startswith("+"):
+                raise ValueError(
+                    "Invite-ссылка требует вступления. Для открытого чата укажи @username."
+                )
+            return first_part
+
+        # Any other URL is not a Telegram chat reference.
+        raise ValueError("Поддерживаются только ссылки t.me/telegram.me")
+
+    if lower.startswith("t.me/") or lower.startswith("telegram.me/"):
+        _, _, path = value.partition("/")
+        path = path.strip("/")
+        if not path:
+            raise ValueError("В ссылке t.me не указан чат")
+        first_part = path.split("/", 1)[0].strip()
+        if first_part.startswith("+") or first_part in {"joinchat", "c", "s"}:
+            raise ValueError(
+                "Эта ссылка не подходит. Используй публичный @username или https://t.me/<username>."
+            )
+        return first_part
+
+    # Plain username without @
+    return value
 
 
 def unique_users(rows: Iterable[UserRow]) -> list[UserRow]:
