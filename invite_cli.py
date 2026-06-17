@@ -3,8 +3,10 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import urlparse
 
 from dotenv import load_dotenv
 from pyrogram import Client
@@ -13,6 +15,8 @@ from pyrogram.errors import (
     ChatAdminRequired,
     ChatWriteForbidden,
     FloodWait,
+    InviteHashExpired,
+    PeerIdInvalid,
     PeerFlood,
     UserAlreadyParticipant,
     UserBannedInChannel,
@@ -21,6 +25,8 @@ from pyrogram.errors import (
     UserKicked,
     UserNotMutualContact,
     UserPrivacyRestricted,
+    UsernameInvalid,
+    UsernameNotOccupied,
 )
 
 ROOT = Path(__file__).resolve().parent
@@ -39,6 +45,20 @@ class SessionRuntime:
     name: str
     client: Client
     invited: int = 0
+
+
+@dataclass
+class InviteTarget:
+    user_id: int | None
+    username: str | None
+
+    @property
+    def add_value(self) -> int | str:
+        if self.username:
+            return self.username
+        if self.user_id is None:
+            raise ValueError("У цели нет ни user_id, ни username")
+        return self.user_id
 
 
 def ask(prompt: str, default: str | None = None) -> str:
@@ -82,32 +102,55 @@ def choose_sessions() -> list[str]:
     return result
 
 
-def parse_txt_base(path: Path) -> list[int]:
+def parse_txt_base(path: Path) -> list[InviteTarget]:
     if not path.exists():
         raise FileNotFoundError(f"Файл базы не найден: {path}")
 
-    users: list[int] = []
+    users: list[InviteTarget] = []
     for raw_line in path.read_text(encoding="utf-8").splitlines():
         line = raw_line.strip()
         if not line:
             continue
 
         if "|" in line:
-            first = line.split("|", 1)[0].strip()
-            if first.lstrip("-").isdigit():
-                users.append(int(first))
+            parts = [part.strip() for part in line.split("|")]
+            first = parts[0] if parts else ""
+            second = parts[1] if len(parts) > 1 else ""
+            user_id: int | None = int(first) if first.lstrip("-").isdigit() else None
+            username: str | None = None
+            if second.startswith("@") and len(second) > 1:
+                username = second[1:].strip() or None
+            elif second and second != "-" and second.replace("_", "").isalnum():
+                username = second
+            if user_id is not None or username:
+                users.append(InviteTarget(user_id=user_id, username=username))
             continue
 
         if line.lstrip("-").isdigit():
-            users.append(int(line))
-
-    seen: set[int] = set()
-    uniq: list[int] = []
-    for user_id in users:
-        if user_id in seen:
+            users.append(InviteTarget(user_id=int(line), username=None))
             continue
-        seen.add(user_id)
-        uniq.append(user_id)
+
+        if line.startswith("@") and len(line) > 1:
+            users.append(InviteTarget(user_id=None, username=line[1:].strip()))
+            continue
+
+        if line.replace("_", "").isalnum():
+            users.append(InviteTarget(user_id=None, username=line))
+
+    seen_ids: set[int] = set()
+    seen_usernames: set[str] = set()
+    uniq: list[InviteTarget] = []
+    for user in users:
+        username_key = (user.username or "").lower()
+        if username_key and username_key in seen_usernames:
+            continue
+        if user.user_id is not None and user.user_id in seen_ids:
+            continue
+        if username_key:
+            seen_usernames.add(username_key)
+        if user.user_id is not None:
+            seen_ids.add(user.user_id)
+        uniq.append(user)
     return uniq
 
 
@@ -120,6 +163,58 @@ async def list_invitable_chats(client: Client) -> list[tuple[int, str]]:
         title = chat.title or str(chat.id)
         chats.append((chat.id, title))
     return chats
+
+
+def normalize_chat_reference(raw: str) -> int | str:
+    value = raw.strip()
+    if not value:
+        raise ValueError("Ссылка/ID пустая")
+
+    if re.fullmatch(r"-?\d+", value):
+        return int(value)
+
+    if value.startswith("@"):
+        username = value[1:].strip()
+        if not username:
+            raise ValueError("Пустой username после @")
+        return username
+
+    lower = value.lower()
+    if lower.startswith(("https://", "http://")):
+        parsed = urlparse(value)
+        host = parsed.netloc.lower()
+        path = parsed.path.strip("/")
+        if not (host.endswith("t.me") or host.endswith("telegram.me")):
+            raise ValueError("Поддерживаются только ссылки t.me/telegram.me")
+        if not path:
+            raise ValueError("В ссылке t.me не указан чат")
+
+        parts = [p for p in path.split("/") if p]
+        first = parts[0]
+        if first.startswith("+"):
+            return f"https://t.me/{first}"
+        if first == "joinchat" and len(parts) > 1:
+            return f"https://t.me/joinchat/{parts[1]}"
+        if first in {"c", "s", "share", "addstickers"}:
+            raise ValueError("Эта ссылка не подходит для выбора чата-цели")
+        return first
+
+    if lower.startswith("t.me/") or lower.startswith("telegram.me/"):
+        normalized = f"https://{value}"
+        return normalize_chat_reference(normalized)
+
+    return value
+
+
+async def resolve_target_chat(client: Client, raw: str):
+    source = raw.strip()
+    normalized = normalize_chat_reference(source)
+    try:
+        return await client.get_chat(normalized)
+    except InviteHashExpired as exc:
+        raise ValueError("Invite-ссылка недействительна (истекла или отозвана)") from exc
+    except (ValueError, UsernameInvalid, UsernameNotOccupied, PeerIdInvalid) as exc:
+        raise ValueError(f"Не удалось открыть чат: {source}") from exc
 
 
 async def choose_target_chat(runtime: SessionRuntime):
@@ -139,7 +234,7 @@ async def choose_target_chat(runtime: SessionRuntime):
         if i < 0 or i >= len(chats):
             raise ValueError("Неверный номер чата")
         return await client.get_chat(chats[i][0])
-    return await client.get_chat(raw)
+    return await resolve_target_chat(client, raw)
 
 
 async def start_runtime(session_name: str) -> SessionRuntime:
@@ -163,9 +258,9 @@ async def run() -> None:
     interval = float(ask("Интервал между инвайтами (сек)", str(DEFAULT_INVITE_INTERVAL)).replace(",", "."))
     invites_per_session = int(ask("Лимит инвайтов на 1 сессию", str(DEFAULT_INVITES_PER_SESSION)))
     txt_file = ask("Путь к TXT-базе", str(DATA_DIR / "members.txt"))
-    user_ids = parse_txt_base(Path(txt_file))
-    if not user_ids:
-        raise ValueError("В TXT базе нет user_id")
+    users = parse_txt_base(Path(txt_file))
+    if not users:
+        raise ValueError("В TXT базе нет user_id/username")
 
     runtimes: list[SessionRuntime] = []
     for name in picked_sessions:
@@ -177,7 +272,7 @@ async def run() -> None:
     try:
         target_chat = await choose_target_chat(runtimes[0])
         print(f"\nЦель: {target_chat.title} ({target_chat.id})")
-        print(f"Пользователей в базе: {len(user_ids)}")
+        print(f"Пользователей в базе: {len(users)}")
         print("Старт инвайтинга...\n")
 
         session_idx = 0
@@ -185,7 +280,7 @@ async def run() -> None:
         skipped = 0
         failed = 0
 
-        for user_id in user_ids:
+        for user in users:
             if session_idx >= len(runtimes):
                 print("Все сессии исчерпаны. Завершение.")
                 break
@@ -199,7 +294,7 @@ async def run() -> None:
                 continue
 
             try:
-                await client.add_chat_members(target_chat.id, user_id)
+                await client.add_chat_members(target_chat.id, user.add_value)
                 invited += 1
                 rt.invited += 1
                 if invited % 10 == 0:
@@ -210,6 +305,9 @@ async def run() -> None:
                 skipped += 1
             except (UserBannedInChannel, UserKicked, UserChannelsTooMuch, UserIdInvalid):
                 failed += 1
+            except PeerIdInvalid:
+                # Для "голого" user_id peer может быть неизвестен сессии.
+                skipped += 1
             except FloodWait as exc:
                 print(f"[{rt.name}] FloodWait {exc.value}s")
                 await asyncio.sleep(exc.value)
@@ -222,7 +320,8 @@ async def run() -> None:
                 break
             except Exception as exc:
                 failed += 1
-                print(f"[{rt.name}] ошибка для user {user_id}: {exc}")
+                user_ref = f"@{user.username}" if user.username else str(user.user_id)
+                print(f"[{rt.name}] ошибка для user {user_ref}: {exc}")
 
             await asyncio.sleep(interval)
 
