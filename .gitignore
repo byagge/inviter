@@ -1,0 +1,34 @@
+# Python cache and bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Environment and local secrets
+.env
+.env.*
+
+# Tool caches
+.pytest_cache/
+.mypy_cache/
+
+# Build and packaging artifacts
+build/
+dist/
+*.egg-info/
+
+# IDE files
+.idea/
+.vscode/
+
+# Logs
+*.log
+
+# Telegram/Pyrogram session files
+*.session
+*.session-journal
